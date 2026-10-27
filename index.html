@@ -241,8 +241,10 @@ svg text { font-family: var(--font-body); font-weight: 600; font-size: 12px; fil
 
   <section class="fine sticker">
     <h2>How the hell does this work?</h2>
-    <p>Every hour gets a drying score from how thirsty the air is (temperature and humidity, as vapour pressure deficit),
-    how windy it is and how much sun is belting down. Rain re-wets the load. We add the scores up from the moment you peg it out until it hits 100%.
+    <p>Proper science, mate. Every hour we run the Penman-Monteith evaporation equation (the one meteorologists use for how fast
+    water leaves wet surfaces) on your washing: sunshine heating it, how thirsty the air is, wind carrying the vapour away, and heat
+    lost to a clear night sky, which can even put dew back on it. Thicker stuff holds more water and lets go of it more slowly.
+    Rain re-wets the load. We add it all up from the moment you peg it out until it hits 100%.
     It's a bloody good guess, not a promise. Forecasts come from <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a>. In the UK and Ireland it uses the Met Office forecast.</p>
   </section>
 </div>
@@ -251,9 +253,11 @@ svg text { font-family: var(--font-body); font-weight: 600; font-size: 12px; fil
 "use strict";
 const HOUR = 3600e3, MIN = 60e3;
 const LOADS = {
-  light: { label: "Light", factor: 1.4, hint: "undies, shirts" },
-  mixed: { label: "Mixed", factor: 1, hint: "the usual shit" },
-  heavy: { label: "Heavy", factor: 0.6, hint: "towels, jeans" },
+  // water: kg held per m² of fabric surface after a spin, including folds and overlaps on the line.
+  // rs: fabric surface resistance (s/m); thicker stuff lets go of water more slowly.
+  light: { label: "Light", water: 0.25, rs: 20, hint: "undies, shirts" },
+  mixed: { label: "Mixed", water: 0.45, rs: 50, hint: "the usual shit" },
+  heavy: { label: "Heavy", water: 0.8, rs: 100, hint: "towels, jeans" },
 };
 const KIND = {
   yes: { big: "Hell yes.", chip: "Fuck yeah", tags: [
@@ -280,23 +284,44 @@ const store = {
 
 /* ---------- Drying model ---------- */
 
-// Saturation vapour pressure (kPa), Tetens formula.
-const satVP = t => 0.6108 * Math.exp(17.27 * t / (t + 237.3));
+// Penman-Monteith, adapted for washing on a line (FAO-56 style, per m² of fabric surface):
+//   λE = [Δ·Rn + ρa·cp·(es − ea)/ra] / [Δ + γ·(1 + rs/ra)]
+// then hours to dry = water held per m² ÷ evaporation per m² per hour.
+const SIGMA = 5.67e-8;        // Stefan-Boltzmann, W/m²K⁴
+const LAMBDA = 2.45e6;        // latent heat of vaporisation, J/kg
+const RHO_CP = 1.2 * 1005;    // air density × specific heat, J/m³K
+const satVP = t => 0.6108 * Math.exp(17.27 * t / (t + 237.3));   // Tetens, kPa
 
-// Percent of a mixed load dried per hour in these conditions.
-function dryingRate(h) {
-  const vpd = Math.max(0, satVP(h.temp) * (1 - h.rh / 100));
-  const wind = Math.min(h.wind, 35);
-  const windF = 0.45 + 0.55 * (wind / 15);   // calm 0.45x, 15 km/h 1x, 35 km/h ~1.7x
-  let r = 9 * vpd * windF + 0.022 * h.rad;   // air term + sun term (W/m²)
-  if (h.temp < 3) r *= 0.6;                   // cold fibres give water up slowly
-  if (h.rh >= 95 && h.rad < 20) r *= 0.2;     // dew or fog
-  return r;
+// Evaporation from wet fabric in kg of water per m² per hour. Negative means dew is forming on it.
+function evaporation(h, load) {
+  const T = h.temp, Tk = T + 273.15;
+  const es = satVP(T), ea = es * h.rh / 100;
+  const delta = 4098 * es / (T + 237.3) ** 2;           // slope of the saturation curve, kPa/K
+  const gamma = 0.000665 * h.pressure;                  // psychrometric constant, kPa/K
+  // Net radiation. A hanging garment catches roughly a fifth of the sunshine on flat ground per m² of its
+  // surface (it's vertical, two-sided and pale). Each face also sees half the sky and loses longwave heat to it:
+  // a lot on a clear night, hardly any under thick cloud.
+  const cloud = h.cloud / 100;
+  const epsClear = 1.24 * Math.pow(ea * 10 / Tk, 1 / 7);            // Brutsaert clear-sky emissivity
+  const epsSky = (1 - 0.84 * cloud) * epsClear + 0.84 * cloud;      // cloud correction
+  const Rn = 0.2 * h.rad - 0.5 * SIGMA * Tk ** 4 * (1 - epsSky);
+  // Aerodynamic resistance from a flat-plate heat transfer coefficient. 10 m wind is scaled to line height
+  // and knocked down for a sheltered back garden.
+  const u = Math.max(0.3, h.wind / 3.6 * 0.75 * 0.6);
+  const ra = RHO_CP / (5.7 + 3.8 * u);                              // s/m
+  const lamE = (delta * Rn + RHO_CP * (es - ea) / ra) / (delta + gamma * (1 + LOADS[load].rs / ra));
+  return lamE / LAMBDA * 3600;
 }
+
+// Percent of the load dried per hour (before the slow last stretch).
+const rateOf = (h, load = state.load) => h.rates[load];
+
+// The last quarter of the water is held deeper in the fibres, so drying slows as it nears 100%.
+const fallingRate = p => p <= 75 ? 1 : Math.max(0.35, 1 - (p - 75) / 25 * 0.65);
 const isWet = h => h.precip >= 0.2;
 
 // Walk forward in 15-minute steps from `start` until the load hits 100%.
-function simulate(start, factor) {
+function simulate(start) {
   const { hours, t0 } = state.data;
   let p = 0, t = start, rainAt = null, maxProb = 0;
   const trace = [{ t, p }];
@@ -307,13 +332,13 @@ function simulate(start, factor) {
     maxProb = Math.max(maxProb, h.prob);
     if (isWet(h)) { rainAt ??= t; p = Math.max(0, p - 20); }
     else {
-      const step = h.rate * factor / 4;
-      if (p + step >= 100) {
+      const step = rateOf(h) * fallingRate(p) / 4;
+      if (step > 0 && p + step >= 100) {
         const done = t + ((100 - p) / step) * 15 * MIN;
         trace.push({ t: done, p: 100 });
         return { done, rainAt, trace, maxProb };
       }
-      p += step;
+      p = Math.max(0, p + step);
     }
     t += 15 * MIN;
     trace.push({ t, p });
@@ -324,18 +349,18 @@ function simulate(start, factor) {
 const driesClean = (r, by) => r.done !== null && r.done <= by && !(r.rainAt !== null && r.rainAt < r.done);
 
 // Latest 15-minute slot you can hang it out and still have it dry by sunset.
-function latestHang(day, factor) {
+function latestHang(day) {
   let best = null;
   for (let s = ceilTo(day.sunrise, 15); s < day.sunset; s += 15 * MIN) {
-    if (driesClean(simulate(s, factor), day.sunset)) best = s;
+    if (driesClean(simulate(s), day.sunset)) best = s;
   }
   return best;
 }
 
 // Earliest slot from `from` that still dries by sunset without getting rained on.
-function earliestHang(day, factor, from) {
+function earliestHang(day, from) {
   for (let s = ceilTo(Math.max(from, day.sunrise), 15); s < day.sunset; s += 15 * MIN) {
-    if (driesClean(simulate(s, factor), day.sunset)) return s;
+    if (driesClean(simulate(s), day.sunset)) return s;
   }
   return null;
 }
@@ -346,9 +371,9 @@ function defaultHang(day, i) {
   return first;
 }
 
-function evaluate(day, i, start, factor) {
-  const r = simulate(start, factor);
-  const latest = latestHang(day, factor);
+function evaluate(day, i, start) {
+  const r = simulate(start);
+  const latest = latestHang(day);
   const dur = r.done ? r.done - start : null;
   const v = { r, latest, start, dur };
   const rainNote = r.maxProb >= 40 && !r.rainAt ? ` There's a ${r.maxProb}% chance of a shower, so keep a bloody eye on it.` : "";
@@ -362,7 +387,7 @@ function evaluate(day, i, start, factor) {
   } else if (r.rainAt !== null && (r.done === null || r.rainAt < r.done)) {
     v.kind = "no";
     v.why = `Rain from about ${fmt(r.rainAt)} will piss all over it before it's dry.`;
-    const later = earliestHang(day, factor, start + 15 * MIN);
+    const later = earliestHang(day, start + 15 * MIN);
     if (later !== null) v.why += ` Wait and hang it out at ${fmt(later)} instead.`;
   } else if (i === 0 && latest !== null && start > latest) {
     v.kind = "late";
@@ -372,7 +397,7 @@ function evaluate(day, i, start, factor) {
     v.why = `The sun buggered off at ${fmt(day.sunset)}. Night air alone won't get it there.`;
   } else {
     v.kind = "no";
-    const need = 100 / Math.max(0.5, avgDaylightRate(day) * factor);
+    const need = 100 / Math.max(0.5, avgDaylightRate(day));
     v.why = `Too cold, damp or still. A ${LOADS[state.load].label.toLowerCase()} load needs about ${Math.round(need)} hours in this air, and there's only ${fmtDur(day.sunset - day.sunrise)} of daylight.`;
   }
   if (latest !== null && v.kind !== "late") v.tip = `Latest hang-out time to be dry by sunset: ${fmt(latest)}.`;
@@ -382,7 +407,7 @@ function evaluate(day, i, start, factor) {
 
 function avgDaylightRate(day) {
   const hs = dayHours(day).filter(h => h.t >= day.sunrise - HOUR && h.t < day.sunset);
-  return hs.reduce((a, h) => a + (isWet(h) ? 0 : h.rate), 0) / Math.max(1, hs.length);
+  return hs.reduce((a, h) => a + (isWet(h) ? 0 : Math.max(0, rateOf(h))), 0) / Math.max(1, hs.length);
 }
 
 // Pick a tagline that stays put for that day and verdict, so it doesn't flicker as you drag the slider.
@@ -425,7 +450,7 @@ const inUKOrIreland = p => p.lat >= 49.8 && p.lat <= 61 && p.lon >= -11 && p.lon
 const UKMO = "ukmo_seamless";
 
 async function fetchForecast(p) {
-  const hourly = "temperature_2m,relative_humidity_2m,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,shortwave_radiation,is_day,cloud_cover";
+  const hourly = "temperature_2m,relative_humidity_2m,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,shortwave_radiation,is_day,cloud_cover,surface_pressure";
   const base = `https://api.open-meteo.com/v1/forecast?latitude=${p.lat}&longitude=${p.lon}&hourly=${hourly}&daily=sunrise,sunset&timezone=auto&forecast_days=8`;
   let j = null, metOffice = false;
   if (inUKOrIreland(p)) {
@@ -451,9 +476,11 @@ async function fetchForecast(p) {
       t: parseLocal(s), temp: pick(H, "temperature_2m", i) ?? 15, rh: pick(H, "relative_humidity_2m", i) ?? 70,
       precip: pick(H, "precipitation", i) ?? 0, prob: prob ?? 0,
       wind: pick(H, "wind_speed_10m", i) ?? 0, gust: pick(H, "wind_gusts_10m", i) ?? 0,
-      rad: pick(H, "shortwave_radiation", i) ?? 0, isDay: !!pick(H, "is_day", i), cloud: pick(H, "cloud_cover", i) ?? 0,
+      rad: pick(H, "shortwave_radiation", i) ?? 0, isDay: !!pick(H, "is_day", i), cloud: pick(H, "cloud_cover", i) ?? 50,
+      pressure: (pick(H, "surface_pressure", i) ?? 1013) / 10,
     };
-    h.rate = dryingRate(h);
+    h.evt = {}; h.rates = {};
+    for (const key in LOADS) { h.evt[key] = evaporation(h, key); h.rates[key] = h.evt[key] / LOADS[key].water * 100; }
     return h;
   });
   const days = j.daily.time.slice(0, 7).map((s, i) => {
@@ -528,15 +555,14 @@ function mascot(kind) {
 
 function renderDay(i) {
   const day = state.data.days[i];
-  const factor = LOADS[state.load].factor;
   const start = hangFor(i);
-  const v = evaluate(day, i, start, factor);
+  const v = evaluate(day, i, start);
   const k = KIND[v.kind];
   const now = nowLocal();
   const nowH = state.data.hours[Math.floor((now - state.data.t0) / HOUR)];
   const hs = dayHours(day);
   const daylight = hs.filter(h => h.t >= day.sunrise - HOUR && h.t < day.sunset);
-  const peak = daylight.reduce((a, h) => h.rate > a.rate ? h : a, daylight[0] || hs[0]);
+  const peak = daylight.reduce((a, h) => rateOf(h) > rateOf(a) ? h : a, daylight[0] || hs[0]);
   const maxProb = Math.max(...daylight.map(h => h.prob));
 
   const minStart = i === 0 ? ceilTo(now, 15) : day.start + 5 * HOUR;
@@ -547,12 +573,14 @@ function renderDay(i) {
   const stats = [];
   if (i === 0 && nowH) {
     stats.push(["Right fucking now", `${Math.round(nowH.temp)}° · ${Math.round(nowH.rh)}%`, `${lightLabel(nowH)}${nowH.rad >= 5 ? `, ${Math.round(nowH.rad)} W/m²` : ""} · wind ${Math.round(nowH.wind)} km/h`]);
-    stats.push(["Drying speed", `${Math.round(nowH.rate * factor)}% an hour`, nowH.isDay ? "on the line, right now" : "in the dark. Meh."]);
+    const e = nowH.evt[state.load];
+    stats.push(["Drying speed", e < 0 ? "Getting wetter" : `${Math.round(rateOf(nowH))}% an hour`,
+      e < 0 ? "dew's forming on it. Bring it in." : `${e.toFixed(2)} kg of water per m² an hour${nowH.isDay ? "" : ", in the dark"}`]);
   } else {
     stats.push(["Top temp", `${Math.round(day.tmax)}°`, `humidity gets down to ${Math.round(Math.min(...daylight.map(h => h.rh)))}%`]);
   }
   stats.push(["Sun's up", `${fmt(day.sunrise)}–${fmt(day.sunset)}`, `${fmtDur(day.sunset - day.sunrise)} of daylight`]);
-  stats.push(["Best bloody hour", peak ? fmt(peak.t) : "–", peak ? `${Math.round(peak.rate * factor)}% an hour` : ""]);
+  stats.push(["Best bloody hour", peak ? fmt(peak.t) : "–", peak ? `${Math.round(rateOf(peak))}% an hour` : ""]);
   stats.push(["Rain", `${(day.rain ?? 0).toFixed(1)} mm`, !state.data.hasProb ? "no % chance given" : maxProb >= 50 ? `${maxProb}% chance. Ugh.` : `${maxProb}% peak chance`]);
   const gust = Math.max(...daylight.map(h => h.gust));
   if (gust >= 50) stats.push(["Gusts", `${Math.round(gust)} km/h`, "peg the shit out of it"]);
@@ -583,7 +611,7 @@ function renderDay(i) {
     <div class="stats">${stats.map(([l, val, sub]) => `<div class="stat sticker"><span class="lbl">${l}</span><span class="val">${val}</span><span class="sub">${sub}</span></div>`).join("")}</div>
     <section class="chart-card sticker">
       <h2>The dryness chart <small>(it's science, mate)</small></h2>
-      <div class="chart-scroll">${chartSVG(day, i, v, factor)}</div>
+      <div class="chart-scroll">${chartSVG(day, i, v)}</div>
       <div class="legend">
         <span><i class="sw" style="background:var(--night)"></i>Dark</span>
         <span><i class="sw" style="background:var(--bar)"></i>Drying power each hour</span>
@@ -601,12 +629,14 @@ function renderDay(i) {
   document.querySelectorAll("[data-load]").forEach(b => b.onclick = () => { state.load = b.dataset.load; store.set("load", state.load); renderDay(i); });
 }
 
-function chartSVG(day, i, v, factor) {
+function chartSVG(day, i, v) {
   const W = 760, H = 280, L = 38, R = 40, T = 32, B = 30;
   const pw = W - L - R, ph = H - T - B;
   const x = ms => L + ((ms - day.start) / (24 * HOUR)) * pw;
   const hs = dayHours(day);
-  const maxRate = Math.max(30, ...hs.map(h => h.rate * factor));
+  const rawMax = Math.max(30, ...hs.map(h => rateOf(h)));
+  const rateStep = rawMax > 90 ? 30 : rawMax > 45 ? 20 : 10;
+  const maxRate = Math.ceil(rawMax / rateStep) * rateStep;
   const yr = r => T + ph - (r / maxRate) * ph;
   const yp = p => T + ph - (p / 100) * ph;
   const bw = pw / 24;
@@ -617,8 +647,7 @@ function chartSVG(day, i, v, factor) {
     s += `<line x1="${L}" x2="${L + pw}" y1="${yp(p)}" y2="${yp(p)}" stroke="var(--muted)" stroke-opacity=".25" stroke-dasharray="${p ? "4 4" : ""}"/>`;
     s += `<text x="${L + pw + 6}" y="${yp(p) + 4}">${p}%</text>`;
   }
-  const rateTicks = maxRate > 60 ? [0, 20, 40, 60] : [0, 10, 20, 30];
-  for (const r of rateTicks) if (r <= maxRate) s += `<text x="${L - 6}" y="${yr(r) + 4}" text-anchor="end">${r}</text>`;
+  for (let r = 0; r <= maxRate; r += rateStep) s += `<text x="${L - 6}" y="${yr(r) + 4}" text-anchor="end">${r}</text>`;
   s += `<text x="${L - 6}" y="${T - 14}" text-anchor="end">%/h</text><text x="${L + pw + 6}" y="${T - 14}">dry</text>`;
   for (let hr = 0; hr < 24; hr += 3) s += `<text x="${x(day.start + hr * HOUR)}" y="${H - 8}" text-anchor="middle">${fmt(day.start + hr * HOUR)}</text>`;
   for (const h of hs) {
@@ -627,7 +656,7 @@ function chartSVG(day, i, v, factor) {
       const rh = Math.min(ph, 18 + h.precip * 12);
       s += `<rect x="${bx}" y="${T}" width="${w}" height="${rh}" rx="4" fill="var(--rain)" stroke="var(--outline)" stroke-width="2"><title>${fmt(h.t)}: ${h.precip.toFixed(1)} mm of bloody rain</title></rect>`;
     } else {
-      const r = h.rate * factor, top = yr(r);
+      const r = Math.max(0, rateOf(h)), top = yr(r);
       if (T + ph - top > 1) s += `<rect x="${bx}" y="${top}" width="${w}" height="${T + ph - top}" rx="4" fill="var(--bar)" stroke="var(--outline)" stroke-width="2"><title>${fmt(h.t)}: ${Math.round(r)}%/h · ${Math.round(h.temp)}° · ${Math.round(h.rh)}% · ${Math.round(h.wind)} km/h · ${Math.round(h.rad)} W/m²</title></rect>`;
     }
     if (h.prob >= 20) s += `<circle cx="${x(h.t) + bw / 2}" cy="${T - 10}" r="${1.5 + h.prob / 30}" fill="var(--rain)" opacity="${0.35 + h.prob / 160}"><title>${h.prob}% chance of rain</title></circle>`;
@@ -639,7 +668,7 @@ function chartSVG(day, i, v, factor) {
   }
   const now = nowLocal();
   if (i === 0 && now > day.start && now < day.start + 24 * HOUR) {
-    s += `<line x1="${x(now)}" x2="${x(now)}" y1="${T - 2}" y2="${T + ph}" stroke="var(--no)" stroke-width="2.5"/><text x="${x(now)}" y="${T - 20}" text-anchor="middle" style="fill:var(--no)">NOW</text>`;
+    s += `<line x1="${x(now)}" x2="${x(now)}" y1="${T - 2}" y2="${T + ph}" stroke="var(--no)" stroke-width="2.5"/><text x="${x(now) + 5}" y="${T + ph - 8}" style="fill:var(--no);stroke:var(--card);stroke-width:5px;paint-order:stroke;stroke-linejoin:round">NOW</text>`;
   }
   const end = day.start + 24 * HOUR;
   const pts = v.r.trace.filter(p => p.t <= end).map(p => `${x(p.t).toFixed(1)},${yp(p.p).toFixed(1)}`).join(" ");
@@ -649,25 +678,24 @@ function chartSVG(day, i, v, factor) {
   }
   s += `<circle cx="${x(v.start)}" cy="${yp(0)}" r="6" fill="var(--peg)" stroke="var(--outline)" stroke-width="2.5"/>`;
   if (v.r.done && v.r.done <= end) {
-    const dx = x(v.r.done), anchor = dx > L + pw - 70 ? "end" : "middle";
+    const dx = x(v.r.done), anchor = dx > L + pw - 70 ? "end" : dx < L + 70 ? "start" : "middle";
     s += `<circle cx="${dx}" cy="${yp(100)}" r="9" fill="var(--yes)" stroke="var(--outline)" stroke-width="3"/>`;
-    s += `<text x="${dx}" y="${yp(100) - 14}" text-anchor="${anchor}" style="fill:var(--ink);font-family:var(--font-display);font-weight:400;font-size:15px">DRY! ${fmt(v.r.done)}</text>`;
+    s += `<text x="${dx}" y="${yp(100) - 15}" text-anchor="${anchor}" style="fill:var(--ink);stroke:var(--card);stroke-width:5px;paint-order:stroke;stroke-linejoin:round;font-family:var(--font-display);font-weight:400;font-size:15px">DRY! ${fmt(v.r.done)}</text>`;
   }
   return s + `</svg>`;
 }
 
 function renderWeek() {
-  const factor = LOADS[state.load].factor;
   const rows = state.data.days.map((day, i) => {
     const start = hangFor(i);
-    const v = evaluate(day, i, start, factor);
+    const v = evaluate(day, i, start);
     const line = v.kind === "yes" ? `Out at ${fmt(start)}, dry by ${fmt(v.r.done)}.`
       : v.kind === "maybe" ? `Dry around ${fmt(v.r.done)}, after dark.`
       : v.why.split(". ")[0].replace(/\.$/, "") + ".";
     const tip = v.tip && v.kind !== "late" ? v.tip.replace("Latest hang-out time to be dry by sunset:", "Hang out by") : "";
     const cells = dayHours(day).map(h => {
       const night = h.t + HOUR <= day.sunrise || h.t >= day.sunset;
-      const a = Math.min(1, (h.rate * factor) / 35);
+      const a = Math.min(1, Math.max(0, rateOf(h)) / 35);
       const bg = isWet(h) ? "var(--rain)" : `color-mix(in srgb, var(--peg) ${Math.round(a * 100)}%, ${night ? "var(--night)" : "var(--card)"})`;
       return `<i style="background:${bg}"></i>`;
     }).join("");
@@ -678,7 +706,7 @@ function renderWeek() {
       <span class="strip" aria-hidden="true">${cells}</span>
     </button>`;
   }).join("");
-  const good = state.data.days.filter((d, i) => evaluate(d, i, hangFor(i), factor).kind === "yes").length;
+  const good = state.data.days.filter((d, i) => evaluate(d, i, hangFor(i)).kind === "yes").length;
   const kind = good >= 4 ? "yes" : good >= 2 ? "maybe" : "no";
   const head = good === 0 ? "Zero fucking drying days." : good === 1 ? "One measly drying day." : `${good} decent drying days.`;
   $("#main").innerHTML = `

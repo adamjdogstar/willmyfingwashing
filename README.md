@@ -22,8 +22,8 @@ Live at https://adamjdogstar.github.io/willmyfingwashing/ once GitHub Pages is o
   - **Just:** dry within 4 hours after sunset
   - **Nope:** rain gets it first, or the air is too damp
   - **Too late:** you missed today's window
-- **Load types:** light 0.25 kg/m² and rs 20 s/m, mixed 0.45 and 50, heavy 0.8 and 100. These are in `LOADS` in `index.html`.
+- **Load types:** light 0.18 kg/m² and rs 20 s/m, mixed 0.3 and 50, heavy 0.5 and 100. These are in `LOADS` in `index.html`.
 
-The radiation share, garden shelter factor and water per m² are calibrated by feel: a 25°C, 40% humidity, sunny, breezy day dries a mixed load in about 2 hours, and a 10°C grey UK day doesn't manage it. Tweak `evaporation()` and `LOADS` in `index.html` if your washing disagrees.
+The radiation share, garden shelter factor and water per m² are calibrated by feel: a mixed load takes about 2 hours on a hot breezy day, about 5 hours on a decent 14°C late-October day in Chester, and never gets there on a grey 11°C drizzly one. Tweak `evaporation()` and `LOADS` in `index.html` if your washing disagrees.
 
 Everything is in `index.html`: no build step and no dependencies apart from two Google Fonts.
